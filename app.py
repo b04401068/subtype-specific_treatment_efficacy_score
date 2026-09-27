@@ -16,14 +16,28 @@ SUBTYPE_CONFIGS = {
 }
 
 # ==============================================================================
+# SYNTHETIC CLINICAL TRIAL GENERATOR
+# ==============================================================================
+def generate_synthetic_rcb(n=350, pcr_rate=0.25, alpha=2.0, beta_param=3.5, max_rcb=5.0, seed=None):
+    """
+    Simulates realistic clinical trial RCB values using a zero-point mass (pCR)
+    and a scaled Beta distribution for residual disease.
+    """
+    rng = np.random.default_rng(seed)
+    n_pcr = int(n * pcr_rate)
+    n_res = n - n_pcr
+    
+    # Residual cancer burden values scaled to clinical support [0.1, max_rcb]
+    res_scores = rng.beta(alpha, beta_param, size=n_res) * (max_rcb - 0.2) + 0.2
+    all_scores = np.concatenate([np.zeros(n_pcr), res_scores])
+    rng.shuffle(all_scores)
+    return np.round(all_scores, 2)
+
+# ==============================================================================
 # MARZYCK WEIGHTED ECDF & STATISTICAL ENGINE
 # ==============================================================================
 def marczyk_wecdf(x, scale=0.0, x0=0.0):
-    """
-    Constructs the weighted empirical CDF:
-    w(x) = 2.0 / (1.0 + exp(scale * (x - x0)))
-    F_tilde(x) = sum_{x_i <= x} w(x_i) / sum_{all} w(x_i)
-    """
+    """Constructs the weighted empirical CDF."""
     if len(x) == 0:
         return lambda grid: np.zeros_like(grid, dtype=float)
 
@@ -36,10 +50,7 @@ def marczyk_wecdf(x, scale=0.0, x0=0.0):
     return interp1d(vals, w_cdf, kind='previous', bounds_error=False, fill_value=(0.0, 1.0))
 
 def compute_marczyk_tes(rcb_A, rcb_B, scale=0.0, x0=0.0):
-    """
-    Computes normalized Riemann area between Treatment B and Treatment A:
-    TES = (1 / max(grid)) * sum_{j} [F_B(g_j) - F_A(g_j)] * (g_{j+1} - g_j)
-    """
+    """Calculates normalized Marczyk TES between Treatment B and Treatment A."""
     if len(rcb_A) == 0 or len(rcb_B) == 0:
         return 0.0
 
@@ -56,7 +67,7 @@ def compute_marczyk_tes(rcb_A, rcb_B, scale=0.0, x0=0.0):
     return float(np.sum(delta_f * dx) / max_g)
 
 def run_permutation_test(rcb_A, rcb_B, subtype_key, n_perms=1000):
-    """Executes 1,000 permutations under H0 to derive empirical two-sided p-values."""
+    """Permutation test under H0 for 1,000 cycles."""
     cfg = SUBTYPE_CONFIGS[subtype_key]
     s, x0 = cfg['scale'], cfg['x0']
 
@@ -81,7 +92,7 @@ def run_permutation_test(rcb_A, rcb_B, subtype_key, n_perms=1000):
     return obs_unwt, p_unwt, obs_wt, p_wt
 
 def parse_input_text(raw_text):
-    """Extracts non-negative floating point numbers from commas, spaces, or lines."""
+    """Extracts non-negative numbers from string inputs."""
     if not raw_text or not raw_text.strip():
         return np.array([])
     clean = raw_text.replace(',', ' ').replace('\n', ' ')
@@ -112,18 +123,34 @@ def get_arm_metrics(scores):
     }
 
 # ==============================================================================
-# STREAMLIT UI SETUP
+# STATE INITIALIZATION (Default 350 Patients Per Arm)
+# ==============================================================================
+if 'default_rcb_A' not in st.session_state:
+    # Treatment A: 25% pCR rate, typical residual profile
+    st.session_state.default_rcb_A = generate_synthetic_rcb(
+        n=350, pcr_rate=0.25, alpha=2.2, beta_param=2.8, seed=42
+    )
+
+if 'default_rcb_B' not in st.session_state:
+    # Treatment B: 42% pCR rate, shifted toward lower residual burden
+    st.session_state.default_rcb_B = generate_synthetic_rcb(
+        n=350, pcr_rate=0.42, alpha=1.8, beta_param=3.8, seed=101
+    )
+
+# ==============================================================================
+# UI CONFIGURATION & CONTROLS
 # ==============================================================================
 st.set_page_config(page_title="RCB & TES Trial Comparator", layout="wide")
 
 st.title("Residual Cancer Burden (RCB) Clinical Trial Comparator")
 st.markdown(
     "Benchmark **Treatment Arm A (Control/Reference)** vs. **Treatment Arm B (Experimental)**. "
-    "Calculates categorical $\\Delta$pCR, standard continuous TES, and **Marczyk Subtype-Specific TES** with 1,000 permutations."
+    "Preloaded with **350 randomized patients per arm**. Calculates $\\Delta$pCR, standard continuous TES, and "
+    "**Marczyk Subtype-Specific TES** with a 1,000-permutation test."
 )
 
 with st.sidebar:
-    st.header("1. Subtype & Parameters")
+    st.header("1. Subtype & Permutations")
     selected_subtype = st.selectbox(
         "Clinical Subtype",
         options=list(SUBTYPE_CONFIGS.keys()),
@@ -135,26 +162,35 @@ with st.sidebar:
     n_perms = st.number_input("Permutations for p-value", min_value=100, max_value=10000, value=1000, step=100)
     
     st.divider()
-    input_mode = st.radio("Input Method", ["Paste Values", "Upload CSV Files"])
+    st.header("2. Synthetic Sample Generator")
+    if st.button("Generate New Random Cohorts (350 each)"):
+        st.session_state.default_rcb_A = generate_synthetic_rcb(n=350, pcr_rate=0.25, alpha=2.2, beta_param=2.8)
+        st.session_state.default_rcb_B = generate_synthetic_rcb(n=350, pcr_rate=0.42, alpha=1.8, beta_param=3.8)
+        st.rerun()
+
+    input_mode = st.radio("Input Mode", ["Pasted / Default Text", "Upload CSV Files"])
 
 col_A, col_B = st.columns(2)
 
-if input_mode == "Paste Values":
+if input_mode == "Pasted / Default Text":
+    default_str_A = ", ".join(map(str, st.session_state.default_rcb_A))
+    default_str_B = ", ".join(map(str, st.session_state.default_rcb_B))
+
     with col_A:
         st.subheader("Treatment Arm A (Reference/Control)")
         txt_A = st.text_area(
-            "Enter RCB values for Arm A (separated by commas, spaces, or lines):",
-            value="0.0, 0.0, 0.45, 1.20, 1.85, 2.10, 2.65, 3.10, 3.80, 4.25",
-            height=180
+            "RCB values (350 randomized patients preloaded):",
+            value=default_str_A,
+            height=200
         )
         rcb_A = parse_input_text(txt_A)
 
     with col_B:
         st.subheader("Treatment Arm B (Experimental)")
         txt_B = st.text_area(
-            "Enter RCB values for Arm B (separated by commas, spaces, or lines):",
-            value="0.0, 0.0, 0.0, 0.0, 0.35, 0.75, 1.10, 1.40, 2.05, 2.60",
-            height=180
+            "RCB values (350 randomized patients preloaded):",
+            value=default_str_B,
+            height=200
         )
         rcb_B = parse_input_text(txt_B)
 
@@ -167,7 +203,7 @@ else:
             col_candidates = [c for c in dfA.columns if 'rcb' in c.lower()]
             rcb_A = dfA[col_candidates[0]].dropna().values if col_candidates else np.array([])
         else:
-            rcb_A = np.array([])
+            rcb_A = st.session_state.default_rcb_A
 
     with col_B:
         st.subheader("Treatment Arm B (Experimental)")
@@ -177,42 +213,43 @@ else:
             col_candidates = [c for c in dfB.columns if 'rcb' in c.lower()]
             rcb_B = dfB[col_candidates[0]].dropna().values if col_candidates else np.array([])
         else:
-            rcb_B = np.array([])
+            rcb_B = st.session_state.default_rcb_B
 
 st.divider()
 
 # ==============================================================================
-# COMPUTATION & OUTPUT
+# RUN ANALYSIS
 # ==============================================================================
 if st.button("Run Full Trial Comparison", type="primary"):
     if len(rcb_A) < 3 or len(rcb_B) < 3:
         st.error("Please supply at least 3 valid non-negative numerical RCB scores for both Arm A and Arm B.")
     else:
-        with st.spinner(f"Computing weighted eCDFs and running {n_perms:,} permutations..."):
+        with st.spinner(f"Computing weighted eCDFs and running {n_perms:,} permutations for {len(rcb_A) + len(rcb_B)} patients..."):
             m_A = get_arm_metrics(rcb_A)
             m_B = get_arm_metrics(rcb_B)
 
-            # Delta pCR & Chi-square
+            # Categorical statistics
             delta_pcr = m_B['pcr_rate'] - m_A['pcr_rate']
             res_A = m_A['n'] - m_A['pcr_count']
             res_B = m_B['n'] - m_B['pcr_count']
             odds_ratio = (m_B['pcr_count'] / max(1, res_B)) / (m_A['pcr_count'] / max(1, res_A))
 
+            # Contingency Chi-Square test
             ctable = np.array([[m_A['pcr_count'], res_A], [m_B['pcr_count'], res_B]])
             expected = np.outer(ctable.sum(axis=1), ctable.sum(axis=0)) / ctable.sum()
             chi2_val = np.sum(((ctable - expected) ** 2) / (expected + 1e-6))
             pcr_p = float(chi2.sf(chi2_val, df=1))
 
-            # Permutations
+            # Marczyk TES & 1000 Permutations
             unwt_tes, unwt_p, wt_tes, wt_p = run_permutation_test(
                 rcb_A, rcb_B, subtype_key=selected_subtype, n_perms=int(n_perms)
             )
 
         st.success("Analysis Complete!")
 
-        # High-level summary cards
+        # High-level metric highlights
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("ΔpCR (Arm B - Arm A)", f"{delta_pcr:+.3f}", f"Chi² p = {pcr_p:.4f}")
+        c1.metric("$\Delta$pCR (Arm B - Arm A)", f"{delta_pcr:+.3f}", f"Chi² p = {pcr_p:.4f}")
         c2.metric("pCR Odds Ratio", f"{odds_ratio:.3f}", f"{m_B['pcr_count']}/{m_B['n']} vs {m_A['pcr_count']}/{m_A['n']}")
         c3.metric("Standard TES", f"{unwt_tes:+.4f}", f"Perm p = {unwt_p:.4f}")
         c4.metric(f"Subtype TES ({selected_subtype})", f"{wt_tes:+.4f}", f"Perm p = {wt_p:.4f}")
@@ -228,7 +265,7 @@ if st.button("Run Full Trial Comparison", type="primary"):
         })
         st.dataframe(res_df, use_container_width=True, hide_index=True)
 
-        # Categorical RCB Table
+        # Categorical Breakdown Table
         st.subheader("Residual Cancer Burden Category Breakdown")
         cat_df = pd.DataFrame([
             {
@@ -252,13 +289,13 @@ if st.button("Run Full Trial Comparison", type="primary"):
         ])
         st.dataframe(cat_df, use_container_width=True, hide_index=True)
 
-        # Dual Step Curve Plots
-        st.subheader("Cumulative Distribution Function (eCDF) Plots")
+        # eCDF Plots
+        st.subheader("Cumulative Distribution Function (eCDF) Curves")
         grid = np.linspace(0, max(np.max(rcb_A), np.max(rcb_B), 4.5), 350)
-        
+
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
 
-        # Standard unweighted
+        # Standard unweighted plot
         fA_unwt = marczyk_wecdf(rcb_A, scale=0.0, x0=0.0)(grid)
         fB_unwt = marczyk_wecdf(rcb_B, scale=0.0, x0=0.0)(grid)
         ax1.step(grid, fA_unwt, label='Treatment A', color='#1f77b4', lw=2)
@@ -271,7 +308,7 @@ if st.button("Run Full Trial Comparison", type="primary"):
         ax1.grid(True, linestyle='--', alpha=0.5)
         ax1.legend(loc='lower right')
 
-        # Subtype weighted
+        # Subtype weighted plot
         fA_wt = marczyk_wecdf(rcb_A, scale=cfg['scale'], x0=cfg['x0'])(grid)
         fB_wt = marczyk_wecdf(rcb_B, scale=cfg['scale'], x0=cfg['x0'])(grid)
         ax2.step(grid, fA_wt, label='Treatment A', color='#1f77b4', lw=2)
